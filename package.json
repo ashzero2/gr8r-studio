@@ -22,5 +22,8 @@
     "lucide": "^0.460.0",
     "prettier": "^3.9.9",
     "vite": "^6.4.4"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.118.0"
   }
 }
