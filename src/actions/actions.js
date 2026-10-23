@@ -3,8 +3,37 @@
    ===================================================================== */
 import { $, $$, TODAY, addD, dOff, esc, fmtDate, iso, parse, uid } from '../core/utils.js';
 import { PR, PSTAT, ST } from '../core/constants.js';
-import { seed } from '../data/seed.js';
-import { D, DEFAULT_PREFS, S, allTasks, canSee, commentsOf, logAct, me, mem, proj, save, task, tasksOf, visibleProjects } from '../core/store.js';
+import { emptyWorkspace, seed } from '../data/seed.js';
+import {
+  D,
+  DEFAULT_PREFS,
+  S,
+  allTasks,
+  canSee,
+  commentsOf,
+  hydrate,
+  logAct,
+  me,
+  mem,
+  proj,
+  saved,
+  save,
+  task,
+  tasksOf,
+  visibleProjects,
+} from '../core/store.js';
+import {
+  clearCloudCache,
+  createWorkspace,
+  flushSave,
+  getSession,
+  loadWorkspace,
+  retrySync,
+  saveWorkspaceMeta,
+  subscribeWorkspace,
+  unsubscribeWorkspace,
+} from '../core/persistence.js';
+import { supabase, supabaseEnabled } from '../core/supabase.js';
 import { fileType, fsize } from '../ui/helpers.js';
 import { effectiveDark } from '../core/theme.js';
 import { mutate, toast } from '../ui/toast.js';
@@ -150,6 +179,117 @@ export function loadingBtn(id, ms, fn) {
     b.setAttribute('aria-busy', 'true');
   }
   setTimeout(fn, ms);
+}
+export function busyBtn(id, fn) {
+  const b = document.getElementById(id);
+  if (b) {
+    b.classList.add('is-loading');
+    b.setAttribute('aria-busy', 'true');
+    b.disabled = true;
+  }
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      if (!b) return;
+      b.classList.remove('is-loading');
+      b.removeAttribute('aria-busy');
+      b.disabled = false;
+    });
+}
+export function authError(err) {
+  const m = (err?.message || '').toLowerCase();
+  if (err?.status === 429 || m.includes('rate limit') || m.includes('too many')) return 'Too many attempts. Try again in a few minutes.';
+  if (m.includes('invalid login') || m.includes('invalid credentials')) return 'Email or password is incorrect.';
+  if (m.includes('already registered') || m.includes('already exists')) return 'That email already has an account. Try signing in.';
+  if (m.includes('email not confirmed')) return 'Verify your email before signing in.';
+  if (m.includes('password')) return 'Use at least 10 characters, including a number or symbol.';
+  if (m.includes('failed to fetch') || m.includes('network')) return "Can't reach the server. Check your connection and try again.";
+  return err?.message || 'Something went wrong. Try again.';
+}
+export function slugify(v) {
+  return (
+    (v || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 63) || 'workspace'
+  );
+}
+export async function createWorkspaceWithSlug(name, slug, memberKey, state) {
+  let attempt = slug;
+  for (let i = 2; i < 6; i++) {
+    try {
+      return await createWorkspace({ name, slug: attempt, memberKey, state });
+    } catch (err) {
+      if (err?.code !== '23505') throw err;
+      attempt = `${slug}-${i}`;
+    }
+  }
+  throw new Error('That workspace URL is already taken');
+}
+export function syncWorkspace(ws) {
+  const meta = { id: ws.workspace.id, name: ws.workspace.name, slug: ws.workspace.slug, memberKey: ws.membership.member_key };
+  hydrate(ws.state, meta);
+  subscribeWorkspace(state => {
+    hydrate(state, meta);
+    render();
+  });
+}
+export async function importLocalWorkspace(user, local) {
+  const state = JSON.parse(JSON.stringify(local));
+  const memberKey = state.me || 'm1';
+  const name = user.user_metadata?.full_name || user.email.split('@')[0];
+  let m = state.members.find(x => x.id === memberKey);
+  if (!m) {
+    m = { id: memberKey, role: 'Owner', team: null, title: '', c: '#6B7280', status: 'active', last: null, tz: '—' };
+    state.members.push(m);
+  }
+  m.email = user.email;
+  m.name = name;
+  m.status = 'active';
+
+  const wsName = state.ws?.name || 'My Workspace';
+  const slug = slugify(state.ws?.url || wsName);
+  const id = await createWorkspaceWithSlug(wsName, slug, memberKey, state);
+  syncWorkspace({ workspace: { id, name: wsName, slug }, membership: { member_key: memberKey }, state });
+
+  try {
+    localStorage.removeItem('gr8r.v2');
+  } catch {
+    /* best-effort */
+  }
+
+  S.ui.auth = null;
+  S.ui.errors = {};
+  go(S.prefs.home || 'home');
+  toast('Imported your local workspace');
+}
+export async function openWorkspace(session, msg) {
+  const ws = await loadWorkspace();
+  if (ws.needsAuth) {
+    S.ui.auth = 'login';
+    render();
+    return;
+  }
+  if (ws.needsWorkspace) {
+    if (saved?.data) {
+      await importLocalWorkspace(session.user, saved.data);
+      return;
+    }
+    S.data = emptyWorkspace({ name: session.user.user_metadata?.full_name, email: session.user.email });
+    S.prefs.name = S.data.members[0].name;
+    S.prefs.title = '';
+    S.ui.auth = 'onboarding';
+    S.ui.onb = 0;
+    render();
+    return;
+  }
+  syncWorkspace(ws);
+  S.ui.auth = null;
+  S.ui.errors = {};
+  go(S.prefs.home || 'home');
+  if (msg) toast(msg);
 }
 export function curProjectId() {
   if (S.ui.route === 'project') return S.ui.params.id;
@@ -1431,6 +1571,10 @@ A.shareAdd = el => {
   toast(`${m.name} can now edit ${p.name}`);
 };
 A.shareInvite = () => {
+  if (supabaseEnabled) {
+    toast('Invites are not enabled yet', { kind: 'info' });
+    return;
+  }
   const m = S.ui.modals[S.ui.modals.length - 1];
   const p = proj(m.id);
   const v = ($('#share-in')?.value || '').trim();
@@ -1495,6 +1639,10 @@ IN.shareAccess = el => {
   });
 };
 A.invite = () => {
+  if (supabaseEnabled) {
+    toast('Invites are not enabled yet', { kind: 'info' });
+    return;
+  }
   S.ui.inviteDraft = '';
   S.ui.errors = {};
   S.ui.pop = null;
@@ -1550,8 +1698,18 @@ A.submitInvite = () => {
     toast(`${list.length} invitation${list.length > 1 ? 's' : ''} sent`);
   });
 };
-A.copyInviteLink = () => copy(`https://gr8rstudio.com/join/${D().ws.url}-7f3k2`, 'Invite link copied');
+A.copyInviteLink = () => {
+  if (supabaseEnabled) {
+    toast('Invites are not enabled yet', { kind: 'info' });
+    return;
+  }
+  copy(`https://gr8rstudio.com/join/${D().ws.url}-7f3k2`, 'Invite link copied');
+};
 A.resendInvite = el => {
+  if (supabaseEnabled) {
+    toast('Invites are not enabled yet', { kind: 'info' });
+    return;
+  }
   S.ui.pop = null;
   render();
   toast(`Invite resent to ${mem(el.dataset.id).email}`);
@@ -1738,6 +1896,11 @@ A.setSearch = el => {
 
 /* workspace, account, prototype controls */
 A.switchWs = el => {
+  if (supabaseEnabled) {
+    S.ui.pop = null;
+    toast('Multiple workspaces are coming later', { kind: 'info' });
+    return;
+  }
   const w = D().workspaces.find(x => x.id === el.dataset.v);
   S.ui.pop = null;
   D().ws = { name: w.name, url: w.name.toLowerCase().replace(/[^a-z0-9]+/g, ''), c: w.c, brand: !!w.brand };
@@ -1747,19 +1910,39 @@ A.switchWs = el => {
 };
 A.newWorkspace = () => {
   S.ui.pop = null;
+  if (supabaseEnabled) {
+    toast('Multiple workspaces are coming later', { kind: 'info' });
+    return;
+  }
   S.ui.auth = 'onboarding';
   S.ui.onb = 1;
   S.ui.onbData.ws = '';
   S.ui.onbData.url = '';
   render();
 };
-A.signOut = () => {
+A.signOut = async () => {
   S.ui.pop = null;
   S.ui.palette = null;
   S.ui.drawer = null;
   S.ui.modals = [];
-  S.ui.auth = 'login';
   S.ui.errors = {};
+
+  if (supabaseEnabled) {
+    await flushSave();
+    unsubscribeWorkspace();
+    clearCloudCache();
+    try {
+      localStorage.removeItem('gr8r.v2');
+    } catch {
+      /* best-effort */
+    }
+    await supabase.auth.signOut();
+    window.location.hash = '';
+    window.location.reload();
+    return;
+  }
+
+  S.ui.auth = 'login';
   render();
 };
 A.shortcuts = () => {
@@ -1768,18 +1951,25 @@ A.shortcuts = () => {
   openModal({ type: 'shortcuts' });
 };
 A.startOnboarding = () => {
+  if (!import.meta.env.DEV) return;
   S.ui.pop = null;
   S.ui.auth = 'onboarding';
   S.ui.onb = 0;
   render();
 };
 A.toggleOffline = () => {
+  if (!import.meta.env.DEV) return;
   S.ui.offline = !S.ui.offline;
   S.ui.pop = null;
   render();
   toast(S.ui.offline ? 'Offline mode on — edits will fail to save' : 'Back online', { kind: S.ui.offline ? 'err' : 'ok' });
 };
 A.retryOnline = el => {
+  if (supabaseEnabled) {
+    el.classList.add('is-loading');
+    retrySync();
+    return;
+  }
   el.classList.add('is-loading');
   setTimeout(() => {
     S.ui.offline = false;
@@ -1788,6 +1978,7 @@ A.retryOnline = el => {
   }, 700);
 };
 A.resetDemo = () => {
+  if (!import.meta.env.DEV) return;
   S.ui.pop = null;
   confirmDlg({
     title: 'Reset demo data?',
@@ -1899,7 +2090,15 @@ A.saveWorkspace = () => {
     toast("Workspace name can't be empty", { kind: 'err' });
     return;
   }
-  loadingBtn('ws-save', 600, () => {
+  busyBtn('ws-save', async () => {
+    if (supabaseEnabled) {
+      try {
+        await saveWorkspaceMeta({ name: n, slug: u || slugify(n) });
+      } catch (err) {
+        toast(err?.code === '23505' ? 'That workspace URL is already taken' : authError(err), { kind: 'err' });
+        return;
+      }
+    }
     if (
       mutate(() => {
         const old = D().ws.name;
@@ -1975,7 +2174,21 @@ A.savePassword = () => {
     render();
     return;
   }
-  loadingBtn('pw-save', 800, () => {
+  busyBtn('pw-save', async () => {
+    if (supabaseEnabled) {
+      const session = await getSession();
+      if (!session) {
+        S.ui.auth = 'login';
+        render();
+        return;
+      }
+      const { error } = await supabase.auth.updateUser({ email: session.user.email, current_password: cur, password: nw });
+      if (error) {
+        S.ui.errors.pwCur = authError(error);
+        render();
+        return;
+      }
+    }
     S.ui.pwDone = true;
     S.ui.pwNew = '';
     render();
@@ -1983,12 +2196,20 @@ A.savePassword = () => {
   });
 };
 A.revokeSession = el => {
+  if (supabaseEnabled) {
+    toast('Session management is not enabled yet', { kind: 'info' });
+    return;
+  }
   mutate(() => {
     D().sessions = D().sessions.filter(s => s.id !== el.dataset.id);
   });
   toast('Session signed out');
 };
-A.revokeAll = () =>
+A.revokeAll = () => {
+  if (supabaseEnabled) {
+    toast('Session management is not enabled yet', { kind: 'info' });
+    return;
+  }
   confirmDlg({
     title: 'Sign out of all other sessions?',
     body: "You'll stay signed in on this device. Other devices will need to sign in again.",
@@ -2002,7 +2223,12 @@ A.revokeAll = () =>
       toast('Signed out of other sessions');
     },
   });
+};
 A.setup2fa = () => {
+  if (supabaseEnabled) {
+    toast('Two-factor authentication is not enabled yet', { kind: 'info' });
+    return;
+  }
   S.ui.tfaSetup = true;
   S.ui.errors = {};
   render();
@@ -2012,6 +2238,10 @@ A.cancel2fa = () => {
   render();
 };
 A.verify2fa = () => {
+  if (supabaseEnabled) {
+    toast('Two-factor authentication is not enabled yet', { kind: 'info' });
+    return;
+  }
   const v = $('#tfa-code').value.trim();
   if (!/^\d{6}$/.test(v)) {
     S.ui.errors.tfa = 'Enter the 6-digit code from your app';
@@ -2025,7 +2255,11 @@ A.verify2fa = () => {
   });
   toast('Two-factor authentication enabled');
 };
-A.disable2fa = () =>
+A.disable2fa = () => {
+  if (supabaseEnabled) {
+    toast('Two-factor authentication is not enabled yet', { kind: 'info' });
+    return;
+  }
   confirmDlg({
     title: 'Turn off two-factor authentication?',
     body: 'Your account will be protected by your password only.',
@@ -2039,6 +2273,7 @@ A.disable2fa = () =>
       toast('Two-factor authentication turned off');
     },
   });
+};
 A.changePlan = el => {
   const v = el.dataset.v;
   const price = { Free: 0, Team: 12, Business: 24 }[v];
@@ -2075,7 +2310,22 @@ A.toggleShowPw = () => {
   }
 };
 export const EMAIL_RE = /^\S+@\S+\.\S+$/;
-export function enterApp(msg) {
+export async function enterApp(msg) {
+  if (supabaseEnabled) {
+    const session = await getSession();
+    if (!session) {
+      S.ui.auth = 'login';
+      render();
+      return;
+    }
+    try {
+      await openWorkspace(session, msg);
+    } catch (err) {
+      S.ui.errors = { login: authError(err) };
+      render();
+    }
+    return;
+  }
   S.ui.auth = null;
   S.ui.errors = {};
   go(S.prefs.home || 'home');
@@ -2095,9 +2345,25 @@ A.doLogin = () => {
     if (!e.email) $('#l-pw').value = pw;
     return;
   }
-  loadingBtn('login-btn', 750, () => enterApp(`Signed in as ${em}`));
+  busyBtn('login-btn', async () => {
+    if (!supabaseEnabled) {
+      await enterApp(`Signed in as ${em}`);
+      return;
+    }
+    const { error } = await supabase.auth.signInWithPassword({ email: em, password: pw });
+    if (error) {
+      S.ui.errors = { login: authError(error) };
+      render();
+      return;
+    }
+    await enterApp(`Signed in as ${em}`);
+  });
 };
 A.socialAuth = el => {
+  if (supabaseEnabled) {
+    toast('Social sign-in is not enabled yet', { kind: 'info' });
+    return;
+  }
   el.classList.add('is-loading');
   setTimeout(() => enterApp(`Signed in with ${el.dataset.v}`), 800);
 };
@@ -2116,7 +2382,32 @@ A.doSignup = () => {
     $('#s-email').value = em;
     return;
   }
-  loadingBtn('signup-btn', 800, () => {
+  busyBtn('signup-btn', async () => {
+    if (!supabaseEnabled) {
+      S.ui.auth = 'verify';
+      startResend();
+      render();
+      return;
+    }
+    const { data, error } = await supabase.auth.signUp({
+      email: em,
+      password: pw,
+      options: { data: { full_name: nm }, emailRedirectTo: window.location.origin },
+    });
+    if (error) {
+      S.ui.errors = { email: authError(error) };
+      render();
+      return;
+    }
+    try {
+      sessionStorage.setItem('gr8r.pendingEmail', em);
+    } catch {
+      /* storage blocked: the verify screen still works this session */
+    }
+    if (data.session) {
+      await enterApp('Account created');
+      return;
+    }
     S.ui.auth = 'verify';
     startResend();
     render();
@@ -2136,18 +2427,49 @@ export function startResend() {
   }, 1000);
 }
 A.resend = el => {
-  if (el.dataset.v === 'verify') {
-    startResend();
-    render();
-    toast(`Verification email sent to ${S.ui.af.email}`);
-  } else toast(`Reset link sent to ${S.ui.af.email}`);
+  const email = S.ui.af?.email;
+  if (!supabaseEnabled) {
+    if (el.dataset.v === 'verify') {
+      startResend();
+      render();
+      toast(`Verification email sent to ${email}`);
+    } else toast(`Reset link sent to ${email}`);
+    return;
+  }
+  if (!email) return;
+  const send = async () => {
+    const { error } =
+      el.dataset.v === 'verify'
+        ? await supabase.auth.resend({ type: 'signup', email, options: { emailRedirectTo: window.location.origin } })
+        : await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/?type=recovery` });
+    if (error) {
+      toast(authError(error), { kind: 'err' });
+      return;
+    }
+    if (el.dataset.v === 'verify') {
+      startResend();
+      render();
+    }
+    toast(el.dataset.v === 'verify' ? `Verification email sent to ${email}` : `Reset link sent to ${email}`);
+  };
+  if (el.dataset.v === 'verify') busyBtn('resend-btn', send);
+  else send();
 };
-A.verified = () => {
-  S.ui.auth = 'onboarding';
-  S.ui.onb = 0;
-  S.ui.onbData.ws = '';
-  S.ui.onbData.url = '';
-  render();
+A.verified = async () => {
+  if (!supabaseEnabled) {
+    S.ui.auth = 'onboarding';
+    S.ui.onb = 0;
+    S.ui.onbData.ws = '';
+    S.ui.onbData.url = '';
+    render();
+    return;
+  }
+  const session = await getSession();
+  if (!session) {
+    toast('Open the verification link in this browser first.', { kind: 'err', ms: 6000 });
+    return;
+  }
+  await enterApp('Email verified');
 };
 A.doForgot = () => {
   const em = $('#f-email').value.trim();
@@ -2158,9 +2480,16 @@ A.doForgot = () => {
     render();
     return;
   }
-  loadingBtn('forgot-btn', 700, () => {
+  busyBtn('forgot-btn', async () => {
+    if (!supabaseEnabled) {
+      S.ui.auth = 'forgot-sent';
+      render();
+      return;
+    }
+    const { error } = await supabase.auth.resetPasswordForEmail(em, { redirectTo: `${window.location.origin}/?type=recovery` });
     S.ui.auth = 'forgot-sent';
     render();
+    if (error) toast(authError(error), { kind: 'err' });
   });
 };
 A.doReset = () => {
@@ -2173,7 +2502,21 @@ A.doReset = () => {
     render();
     return;
   }
-  loadingBtn('reset-btn', 700, () => {
+  busyBtn('reset-btn', async () => {
+    if (supabaseEnabled) {
+      const { error } = await supabase.auth.updateUser({ password: a });
+      if (error) {
+        S.ui.errors = { pw: authError(error) };
+        render();
+        return;
+      }
+      S.ui.pwNew = '';
+      S.ui.auth = 'reset-done';
+      render();
+      window.history.replaceState({}, '', window.location.pathname + (window.location.hash || ''));
+      await supabase.auth.signOut();
+      return;
+    }
     S.ui.auth = 'reset-done';
     S.ui.pwNew = '';
     render();
@@ -2232,7 +2575,7 @@ A.onbNext = el => {
     return;
   }
   if (S.ui.onb === 4 && el.dataset.skip) o.invites = '';
-  if (S.ui.onb === 4 && !el.dataset.skip) {
+  if (S.ui.onb === 4 && !el.dataset.skip && !supabaseEnabled) {
     const bad = (o.invites || '').split(',').filter(x => x && !EMAIL_RE.test(x));
     if (bad.length) {
       toast(`${bad[0]} isn't a valid email address`, { kind: 'err' });
@@ -2244,17 +2587,22 @@ A.onbNext = el => {
   setTimeout(() => $('.auth input')?.focus(), 20);
 };
 A.onbExit = () => {
+  if (supabaseEnabled) {
+    A.signOut();
+    return;
+  }
   S.ui.auth = null;
   render();
 };
-A.onbFinish = () => {
+A.onbFinish = async () => {
   const o = S.ui.onbData;
+  const snap = snapshot();
   let p;
   mutate(() => {
     if (o.ws.trim()) {
       const c = ['#2F2E2A', '#5A67D8', '#23918A', '#C54B78'][D().workspaces.length % 4];
       D().ws = { name: o.ws.trim(), url: o.url || 'workspace', c };
-      if (!D().workspaces.some(w => w.name === D().ws.name)) D().workspaces.push({ id: uid('w'), name: D().ws.name, c, plan: 'Free' });
+      if (!supabaseEnabled && !D().workspaces.some(w => w.name === D().ws.name)) D().workspaces.push({ id: uid('w'), name: D().ws.name, c, plan: 'Free' });
     }
     S.prefs.defaultTab = { kanban: 'board', list: 'list', timeline: 'timeline', table: 'table' }[o.team] || 'board';
     const tm = TEMPLATES.find(t => t.id === o.tmpl) || TEMPLATES[2];
@@ -2269,24 +2617,51 @@ A.onbFinish = () => {
       },
       tm.id,
     );
-    (o.invites || '')
-      .split(',')
-      .filter(x => EMAIL_RE.test(x))
-      .forEach(e =>
-        D().members.push({
-          id: uid('m'),
-          name: e.split('@')[0].replace(/\b\w/g, c => c.toUpperCase()),
-          email: e,
-          role: 'Member',
-          team: me().team,
-          title: 'Member',
-          c: '#6B7280',
-          status: 'invited',
-          last: null,
-          tz: '—',
-        }),
-      );
+    if (!supabaseEnabled)
+      (o.invites || '')
+        .split(',')
+        .filter(x => EMAIL_RE.test(x))
+        .forEach(e =>
+          D().members.push({
+            id: uid('m'),
+            name: e.split('@')[0].replace(/\b\w/g, c => c.toUpperCase()),
+            email: e,
+            role: 'Member',
+            team: me().team,
+            title: 'Member',
+            c: '#6B7280',
+            status: 'invited',
+            last: null,
+            tz: '—',
+          }),
+        );
   });
+
+  if (supabaseEnabled) {
+    const memberKey = D().me;
+    const name = D().ws.name;
+    const slug = slugify(D().ws.url || name);
+    try {
+      const id = await createWorkspaceWithSlug(name, slug, memberKey, D());
+      S.data.workspaces = [{ id, name, c: D().ws.c, plan: 'Free' }];
+      try {
+        localStorage.removeItem('gr8r.v2');
+      } catch {
+        /* best-effort */
+      }
+      subscribeWorkspace(state => {
+        hydrate(state, { id, name, slug, memberKey });
+        render();
+      });
+    } catch (err) {
+      restore(snap);
+      S.ui.onb = 1;
+      S.ui.errors.ws = err?.code === '23505' ? 'That workspace URL is already taken' : authError(err);
+      render();
+      return;
+    }
+  }
+
   S.ui.auth = null;
   go('project', { id: p.id, tab: S.prefs.defaultTab });
   toast(`Welcome to ${D().ws.name}`);

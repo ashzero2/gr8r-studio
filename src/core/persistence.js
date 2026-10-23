@@ -131,6 +131,18 @@ export async function saveWorkspaceMeta({ name, slug }) {
 /* ---------- versioned snapshot save ---------- */
 export function queueSave(state) {
   if (!supabaseEnabled || !workspaceId) return;
+
+  let size = 0;
+  try {
+    size = JSON.stringify(state).length;
+  } catch {
+    size = 0;
+  }
+  if (size > 900 * 1024) {
+    notifyFn && notifyFn({ status: 'too-large', size });
+    return;
+  }
+
   pending = state;
   clearTimeout(timer);
   timer = setTimeout(flush, 250);
@@ -138,9 +150,9 @@ export function queueSave(state) {
 
 export function flushSave() {
   return new Promise(resolve => {
-    if (!inFlight && !pending) return resolve();
+    const deadline = Date.now() + 5000;
     const check = () => {
-      if (!inFlight && !pending) resolve();
+      if ((!inFlight && !pending) || Date.now() > deadline) resolve();
       else setTimeout(check, 50);
     };
     check();
@@ -216,6 +228,11 @@ let _channel = null;
 export function subscribeWorkspace(onState) {
   if (!supabaseEnabled || !workspaceId) return;
 
+  if (_channel) {
+    supabase.removeChannel(_channel);
+    _channel = null;
+  }
+
   _channel = supabase
     .channel(`workspace:${workspaceId}`)
     .on(
@@ -264,4 +281,8 @@ export function unsubscribeWorkspace() {
     supabase.removeChannel(_channel);
     _channel = null;
   }
+  workspaceId = null;
+  version = 0;
+  pending = null;
+  clearTimeout(timer);
 }

@@ -542,3 +542,53 @@ export function seed() {
     },
   };
 }
+
+/* A brand-new cloud workspace starts with no demo content: one owner, no projects or tasks. */
+export function emptyWorkspace(user = {}) {
+  const name = user.name || (user.email ? user.email.split('@')[0] : 'You');
+  return {
+    ws: { name: '', url: '', c: '#1D1C1A' },
+    workspaces: [],
+    me: 'm1',
+    members: [
+      {
+        id: 'm1',
+        name,
+        email: user.email || '',
+        role: 'Owner',
+        team: null,
+        title: '',
+        c: '#5A67D8',
+        status: 'active',
+        last: 0,
+        tz: '—',
+      },
+    ],
+    projects: [],
+    tasks: [],
+    comments: [],
+    activity: [],
+    notifs: [],
+    files: [],
+    events: [],
+    teams: [],
+    projOrder: [],
+    savedViews: [],
+    recentSearches: [],
+    sessions: [],
+    invoices: [],
+    tfa: false,
+    notifPrefs: {
+      email_mention: true,
+      email_assign: true,
+      email_digest: true,
+      email_comment: false,
+      push_mention: true,
+      push_assign: true,
+      push_comment: true,
+      push_due: true,
+      mention_all: true,
+      assign_self: true,
+    },
+  };
+}

@@ -2,6 +2,7 @@
 import { $, esc } from '../core/utils.js';
 import { ic } from '../core/icons.js';
 import { S, save } from '../core/store.js';
+import { supabaseEnabled } from '../core/supabase.js';
 import { render } from '../shell/render.js';
 
 export function toast(msg, opt = {}) {
@@ -27,7 +28,7 @@ export function toast(msg, opt = {}) {
 }
 /* guarded mutation: simulates offline failures for the "Failed to save" state */
 export function mutate(fn, label) {
-  if (S.ui.offline) {
+  if (S.ui.offline && !supabaseEnabled) {
     toast("Your changes couldn't be saved. You're offline.", { kind: 'err', action: 'Try again', onAction: () => mutate(fn, label) });
     return false;
   }

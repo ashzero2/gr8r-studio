@@ -2,8 +2,11 @@
 import { TODAY, diffD, iso, parse, uid } from './utils.js';
 import { PCOLORS, TEAMS_SEED } from './constants.js';
 import { seed } from '../data/seed.js';
+import { queueSave, readCache } from './persistence.js';
+import { supabaseEnabled } from './supabase.js';
 
 export const STORE_KEY = 'gr8r.v2';
+export const PREFS_KEY = 'gr8r.prefs';
 export const DEFAULT_PREFS = {
   theme: 'system',
   accent: 'indigo',
@@ -29,11 +32,18 @@ export function load() {
   } catch {
     /* storage blocked or corrupt: start from seed data */
   }
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* storage blocked or corrupt: start from seed data */
+  }
   return null;
 }
 export const saved = load();
+const cached = readCache();
 export const S = {
-  data: saved?.data || seed(),
+  data: cached?.state || saved?.data || seed(),
   prefs: Object.assign({}, DEFAULT_PREFS, saved?.prefs || {}),
   views: saved?.views || {},
   ui: {
@@ -86,12 +96,56 @@ export let _saveT;
 export function save() {
   clearTimeout(_saveT);
   _saveT = setTimeout(() => {
+    const local = { prefs: S.prefs, views: S.views, collapsed: S.ui.collapsed };
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify({ data: S.data, prefs: S.prefs, views: S.views, collapsed: S.ui.collapsed }));
+      localStorage.setItem(PREFS_KEY, JSON.stringify(local));
+    } catch {
+      /* storage blocked: prefs stay in memory */
+    }
+
+    if (supabaseEnabled) {
+      queueSave(S.data);
+      return;
+    }
+
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({ data: S.data, ...local }));
     } catch {
       /* storage full or blocked: keep working in memory */
     }
   }, 150);
+}
+
+/* Remote snapshot -> app state. The DB row is canonical for the workspace name/slug. */
+export function hydrate(state, ws = {}) {
+  if (state && Object.keys(state).length) S.data = state;
+
+  if (ws.memberKey) {
+    S.data.me = ws.memberKey;
+    if (!S.data.members.some(m => m.id === ws.memberKey)) {
+      S.data.members.push({
+        id: ws.memberKey,
+        name: S.prefs.name,
+        email: '',
+        role: 'Owner',
+        team: null,
+        title: '',
+        c: '#6B7280',
+        status: 'active',
+        last: null,
+        tz: '—',
+      });
+    }
+  }
+
+  if (ws.name) S.data.ws = Object.assign({}, S.data.ws, { name: ws.name, url: ws.slug || S.data.ws.url });
+  if (ws.id) S.data.workspaces = [{ id: ws.id, name: S.data.ws.name, c: S.data.ws.c, plan: 'Free' }];
+
+  const m = S.data.members.find(x => x.id === S.data.me);
+  if (m) {
+    if (m.name) S.prefs.name = m.name;
+    if (m.title) S.prefs.title = m.title;
+  }
 }
 
 /* ---------- lookups ---------- */
